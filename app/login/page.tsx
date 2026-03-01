@@ -18,8 +18,15 @@ export default function LoginPage() {
         setIsLoading(true);
 
         try {
-            await login(username, password);
-            router.push("/");
+            const data = await login(username, password);
+            // Role-based redirect
+            if (data.role === "admin") {
+                router.push("/dashboard/admin");
+            } else if (data.role === "engineer") {
+                router.push("/dashboard/engineer");
+            } else {
+                router.push("/");
+            }
         } catch (err: unknown) {
             setError(
                 err instanceof Error ? err.message : "Login failed. Please try again."
