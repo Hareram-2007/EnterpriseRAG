@@ -23,7 +23,12 @@ from auth import (
     get_current_user, users_db,
 )
 from vector_store import vector_store
-from rag_pipeline import generate_response, generate_response_stream
+from rag_pipeline import (
+    generate_response, 
+    generate_response_stream,
+    agentic_router,
+    _get_history,
+)
 
 load_dotenv()
 
@@ -181,20 +186,30 @@ async def chat(
     logger.info(f"Chat request | user={username} | role={user_role} | q='{body.question[:80]}'")
 
     try:
-        # Step 1: Semantic search with role filtering
-        context_docs = vector_store.search(
-            query=body.question,
-            top_k=3,
-            user_role=user_role,
-        )
+        # Step 1: Agentic Routing (Decide whether to search and reformulate query)
+        history = _get_history(username)
+        router_decision = agentic_router(body.question, history)
+        
+        # Step 2: Conditional Semantic Search
+        context_docs = []
+        if router_decision.get("needs_search", True):
+            search_query = router_decision.get("search_query") or body.question
+            logger.info(f"Router decided to search with query: '{search_query[:50]}'")
+            context_docs = vector_store.search(
+                query=search_query,
+                top_k=3,
+                user_role=user_role,
+            )
+            logger.info(f"Retrieved {len(context_docs)} documents for user {username}")
+        else:
+            logger.info(f"Router decided to skip vector search for user {username}")
 
-        logger.info(f"Retrieved {len(context_docs)} documents for user {username}")
-
-        # Step 2: Generate response
+        # Step 3: Generate response
         result = generate_response(
             question=body.question,
             context_docs=context_docs,
             user_role=user_role,
+            username=username,
         )
 
         latency = time.time() - start_time
@@ -241,17 +256,27 @@ async def chat_stream(
     logger.info(f"Stream chat request | user={username} | role={user_role} | q='{body.question[:80]}'")
 
     try:
-        context_docs = vector_store.search(
-            query=body.question,
-            top_k=3,
-            user_role=user_role,
-        )
+        history = _get_history(username)
+        router_decision = agentic_router(body.question, history)
+        
+        context_docs = []
+        if router_decision.get("needs_search", True):
+            search_query = router_decision.get("search_query") or body.question
+            logger.info(f"Router decided to search with query: '{search_query[:50]}'")
+            context_docs = vector_store.search(
+                query=search_query,
+                top_k=3,
+                user_role=user_role,
+            )
+        else:
+            logger.info(f"Router decided to skip vector search for user {username}")
 
         async def event_generator():
             async for chunk in generate_response_stream(
                 question=body.question,
                 context_docs=context_docs,
                 user_role=user_role,
+                username=username,
             ):
                 yield f"data: {chunk}\n\n"
             yield "data: [DONE]\n\n"
