@@ -69,8 +69,8 @@ export default function Navbar({ onInquireClick }: NavbarProps) {
             animate={hidden ? "hidden" : "visible"}
             transition={{ duration: 0.35, ease: "easeInOut" }}
             className={`fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-8 py-5 transition-colors duration-500 ${scrolled
-                    ? "bg-pagani-black/80 backdrop-blur-md border-b border-white/10"
-                    : "bg-transparent"
+                ? "bg-pagani-black/80 backdrop-blur-md border-b border-white/10"
+                : "bg-transparent"
                 }`}
         >
             {/* Logo */}
@@ -111,10 +111,10 @@ export default function Navbar({ onInquireClick }: NavbarProps) {
                     </button>
                 ) : (
                     <a
-                        href="/login"
+                        href="/register"
                         className="hidden md:block text-xs font-bold tracking-[0.15em] uppercase text-white border border-white/20 px-5 py-2 hover:bg-white hover:text-black transition-all"
                     >
-                        Sign In
+                        Sign Up
                     </a>
                 )}
             </div>

@@ -86,8 +86,8 @@ export default function Home() {
               Enterprise Access Portal
             </p>
             <div className="flex gap-6 z-10">
-              <a href="/login" className="px-8 py-3 bg-pagani-gold/10 border border-pagani-gold/40 text-pagani-gold font-bold tracking-[0.15em] uppercase hover:bg-pagani-gold hover:text-black transition-all" style={{ fontFamily: "var(--font-orbitron)" }}>Sign In</a>
-              <a href="/register" className="px-8 py-3 bg-white/5 border border-white/20 text-white font-bold tracking-[0.15em] uppercase hover:bg-white hover:text-black transition-all" style={{ fontFamily: "var(--font-orbitron)" }}>Register</a>
+              <a href="/register" className="px-8 py-3 bg-pagani-gold/10 border border-pagani-gold/40 text-pagani-gold font-bold tracking-[0.15em] uppercase hover:bg-pagani-gold hover:text-black transition-all" style={{ fontFamily: "var(--font-orbitron)" }}>Sign Up</a>
+              <a href="/login" className="px-8 py-3 bg-white/5 border border-white/20 text-white font-bold tracking-[0.15em] uppercase hover:bg-white hover:text-black transition-all" style={{ fontFamily: "var(--font-orbitron)" }}>Login</a>
             </div>
           </section>
         ) : authState.role !== "viewer" ? (
