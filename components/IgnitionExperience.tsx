@@ -163,8 +163,8 @@ export default function IgnitionExperience({ onComplete }: { onComplete: () => v
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ delay: 1, duration: 0.8 }}
                         >
-                            <Link href="/login" className="group relative text-white/80 hover:text-white transition-colors">
-                                Sign In
+                            <Link href="/register" className="group relative text-white/80 hover:text-white transition-colors">
+                                Sign Up
                                 <span className="absolute -bottom-2 left-0 w-0 h-[1px] bg-[#D4AF37] group-hover:w-full transition-all duration-300" />
                             </Link>
                             <Link href="/login" className="group relative text-white/80 hover:text-white transition-colors">
