@@ -22,14 +22,20 @@ Frontend (Next.js 16 + Tailwind v4)       Backend (FastAPI + Gemini)
                                           └──────────┬───────────────────┘
                                                      │
                                           ┌──────────▼───────────────────┐
-                                          │  FAISS Vector Store          │
-                                          │  (12 Enterprise Docs)        │
-                                          │  Gemini Embeddings           │
+                                          │  Agentic Query Router        │
+                                          │  Session Memory Map          │
+                                          └──────────┬───────────────────┘
+                                                     │
+                                          ┌──────────▼───────────────────┐
+                                          │  Hybrid Search Engine        │
+                                          │  - FAISS Vector Embeddings   │
+                                          │  - Keyword TF Scoring        │
+                                          │  - Reciprocal Rank Fusion    │
                                           │  Runtime Role Access Filter  │
                                           └──────────┬───────────────────┘
                                                      │
                                           ┌──────────▼───────────────────┐
-                                          │  Gemini 1.5 Pro (LLM)        │
+                                          │  Gemini 2.5 Flash (LLM)      │
                                           │  Strict Context Grounding    │
                                           │  Streaming + Attribution     │
                                           └──────────────────────────────┘
@@ -160,9 +166,10 @@ npm run dev
 | Frontend | Next.js 16, TypeScript, Tailwind CSS v4, Framer Motion |
 | Canvas | HTML5 Canvas with devicePixelRatio scaling |
 | Backend | FastAPI, Uvicorn, Python 3.10+ |
+| Search Engine | Hybrid Search (Semantic FAISS + Keyword TF + RRF) |
 | Vector DB | FAISS (IndexFlatIP with L2 normalization) |
 | Embeddings | Gemini `gemini-embedding-001` (3072-dim) |
-| LLM | Gemini `2.0 Flash` |
+| LLM | Gemini `2.5 Flash` (Router & Generator) |
 | Auth | JWT (python-jose), bcrypt (passlib) |
 | Rate Limit | slowapi |
 
