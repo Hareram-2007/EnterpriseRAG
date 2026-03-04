@@ -50,3 +50,9 @@ venv/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# logs
+/logs/
+
+# SQLite
+*.db
