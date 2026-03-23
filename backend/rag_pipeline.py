@@ -46,8 +46,13 @@ def _add_to_history(username: str, question: str, answer: str):
     if len(chat_sessions[username]) > MAX_SESSION_TURNS * 2:
         chat_sessions[username] = chat_sessions[username][-MAX_SESSION_TURNS * 2:]
 
-# ── System Prompts ──
-SYSTEM_PROMPT = """You are an AI assistant specialized in Pagani hypercars and engineering.
+
+# ═══════════════════════════════════════════
+# Prompt Template System
+# ═══════════════════════════════════════════
+
+PROMPT_TEMPLATES = {
+    "default": """You are an AI assistant specialized in Pagani hypercars and engineering.
 
 Use ONLY the information provided in the context.
 
@@ -57,11 +62,56 @@ If the answer is not found in the context say:
 Context:
 {context}
 
-User Question:
+Conversation History:
 {history}
 
-Provide a clear technical explanation.
+User Question: {question}
+
+Provide a clear technical explanation with source citations.""",
+
+    "structured": """You are an AI assistant specialized in Pagani hypercars and engineering.
+
+Use ONLY the information provided in the context. Always format your response as:
+- **Summary**: A brief 1-2 sentence answer
+- **Details**: Detailed explanation with bullet points
+- **Sources**: List the source documents you referenced
+- **Confidence**: Rate your confidence as High/Medium/Low with justification
+
+Context:
+{context}
+
+Conversation History:
+{history}
+
+User Question: {question}""",
+
+    "bullet_summary": """You are an AI assistant specialized in Pagani hypercars and engineering.
+
+Use ONLY the information provided in the context.
+Provide your answer as concise bullet points. Include source citations inline.
+
+Context:
+{context}
+
+Conversation History:
+{history}
+
+User Question: {question}""",
+}
+
+# ── Few-Shot Examples (prepended to system prompt) ──
+FEW_SHOT_EXAMPLES = """
+--- Example 1 ---
+Question: What engine does the Zonda use?
+Answer: The Pagani Zonda is powered by a naturally aspirated Mercedes-AMG M120 7.3L V12 engine, producing up to 760 HP in the Zonda R variant. [Source: pagani_zonda_specs]
+
+--- Example 2 ---
+Question: How is the Huayra's active aero system different?
+Answer: The Huayra features four independently controlled active aerodynamic flaps — two at the front and two at the rear — that adjust based on speed, cornering forces, and driver input to optimize downforce and reduce drag. [Source: pagani_huayra_aero]
+---
 """
+
+
 
 
 ROUTER_PROMPT = """You are an intelligent query routing agent for Pagani Automobili.
@@ -89,14 +139,26 @@ def _build_history_text(history: list[dict]) -> str:
     return "\n".join(f"{msg['role'].capitalize()}: {msg['content']}" for msg in history)
 
 
-def _build_prompt(context_docs: list[dict], user_role: str, history: list[dict]) -> str:
-    """Build the system prompt with retrieved context and history."""
+def _build_prompt(
+    context_docs: list[dict],
+    user_role: str,
+    history: list[dict],
+    question: str = "",
+    template: str = "default",
+) -> str:
+    """Build the system prompt with retrieved context, history, and few-shot examples."""
     context_text = "\n\n".join(
         f"[Source: {doc['source']}] (Relevance Score: {doc['score']:.3f})\n{doc['content']}"
         for doc in context_docs
     )
     history_text = _build_history_text(history)
-    return SYSTEM_PROMPT.format(context=context_text, user_role=user_role, history=history_text)
+    prompt_template = PROMPT_TEMPLATES.get(template, PROMPT_TEMPLATES["default"])
+    return FEW_SHOT_EXAMPLES + prompt_template.format(
+        context=context_text,
+        user_role=user_role,
+        history=history_text,
+        question=question,
+    )
 
 def agentic_router(question: str, history: list[dict]) -> dict:
     """
@@ -123,16 +185,18 @@ def agentic_router(question: str, history: list[dict]) -> dict:
         return {"needs_search": True, "search_query": question}
 
 
-def _assess_confidence(context_docs: list[dict]) -> str:
-    """Assess confidence based on LLM reranking scores (0-100)."""
+def _assess_confidence(context_docs: list[dict]) -> dict:
+    """Assess confidence based on LLM reranking scores. Returns numeric + label."""
     if not context_docs:
-        return "low"
+        return {"score": 0, "label": "low"}
     avg_score = sum(d["score"] for d in context_docs) / len(context_docs)
     if avg_score > 80:
-        return "high"
+        label = "high"
     elif avg_score > 50:
-        return "medium"
-    return "low"
+        label = "medium"
+    else:
+        label = "low"
+    return {"score": round(avg_score, 1), "label": label}
 
 
 def generate_response(
@@ -140,16 +204,21 @@ def generate_response(
     context_docs: list[dict],
     user_role: str = "viewer",
     username: str = "guest",
+    output_format: str = "default",
 ) -> dict:
     """
-    Generate a RAG response using Gemini 1.5 Pro with memory.
-    Returns: {answer, sources, confidence}
+    Generate a RAG response using Gemini with memory.
+    Returns: {answer, sources, confidence, confidence_score, latency_s}
     """
+
     start_time = time.time()
 
     try:
         history = _get_history(username)
-        system_prompt = _build_prompt(context_docs, user_role, history)
+        system_prompt = _build_prompt(
+            context_docs, user_role, history,
+            question=question, template=output_format,
+        )
         
         model = genai.GenerativeModel(
             model_name=GENERATION_MODEL,
@@ -164,15 +233,15 @@ def generate_response(
             "The requested information is not available in the provided enterprise data."
         )
 
-        # Build sources list
-        sources = [doc["source"] for doc in context_docs]
-        confidence = _assess_confidence(context_docs) if sources else "N/A"
+        # Build sources list with citation
+        sources = list({doc["source"] for doc in context_docs})
+        confidence = _assess_confidence(context_docs) if sources else {"score": 0, "label": "N/A"}
 
         latency = time.time() - start_time
         logger.info(
             f"RAG response generated | question='{question[:60]}...' | "
             f"role={user_role} | sources={len(sources)} | "
-            f"confidence={confidence} | latency={latency:.2f}s"
+            f"confidence={confidence['label']} ({confidence['score']}) | latency={latency:.2f}s"
         )
         
         # Save to memory
@@ -181,8 +250,11 @@ def generate_response(
         return {
             "answer": answer,
             "sources": sources,
-            "confidence": confidence,
+            "confidence": confidence["label"],
+            "confidence_score": confidence["score"],
+            "latency_s": round(latency, 2),
         }
+
 
     except Exception as e:
         latency = time.time() - start_time
