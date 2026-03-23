@@ -64,3 +64,21 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
             )
 
         return await call_next(request)
+
+
+class RequestTracingMiddleware(BaseHTTPMiddleware):
+    """Generate and propagate X-Request-Id for request tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        from error_handlers import trace_id_ctx, generate_trace_id
+
+        # Use incoming trace ID or generate a new one
+        trace_id = request.headers.get("X-Request-Id") or generate_trace_id()
+        token = trace_id_ctx.set(trace_id)
+
+        try:
+            response: Response = await call_next(request)
+            response.headers["X-Request-Id"] = trace_id
+            return response
+        finally:
+            trace_id_ctx.reset(token)

@@ -57,8 +57,45 @@ security = HTTPBearer(auto_error=False)
 # Structure: { username: { password_hash, role, created_at } }
 users_db: dict[str, dict] = {}
 
+
+def _load_users_from_db():
+    """Load persisted users from DB into in-memory store on startup."""
+    try:
+        from database import get_db_session
+        from models import User
+        with get_db_session() as db:
+            for user in db.query(User).all():
+                if user.name not in users_db:
+                    users_db[user.name] = {
+                        "password_hash": user.password_hash,
+                        "role": user.role,
+                        "created_at": getattr(user, "created_at", datetime.now(timezone.utc).isoformat()),
+                    }
+        if users_db:
+            logger.info(f"Loaded {len(users_db)} users from database")
+    except Exception as e:
+        logger.warning(f"Could not load users from DB (non-fatal): {e}")
+
+
+# Load users on module import
+_load_users_from_db()
+
 # ── Valid Roles ──
-VALID_ROLES = {"admin", "engineer", "viewer"}
+VALID_ROLES = {"super_admin", "admin", "engineer", "viewer"}
+
+# ── Permission Matrix ──
+ROLE_PERMISSIONS: dict[str, list[str]] = {
+    "super_admin": ["read", "write", "delete", "execute", "manage_roles", "manage_users"],
+    "admin": ["read", "write", "delete", "execute", "manage_users"],
+    "engineer": ["read", "write", "execute"],
+    "viewer": ["read"],
+}
+
+# ── Brute-Force Protection ──
+# Track failed login attempts: { ip_or_username: { count, locked_until } }
+_login_attempts: dict[str, dict] = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
 
 
 # ═══════════════════════════════════════════
@@ -237,6 +274,57 @@ async def get_current_user(
     return user_data
 
 
+def require_permission(permission: str):
+    """
+    Dependency factory: checks if current user's role has the required permission.
+    Usage: Depends(require_permission("manage_roles"))
+    """
+    async def _check(current_user: dict = Depends(get_current_user)):
+        role = current_user.get("role", "viewer")
+        perms = ROLE_PERMISSIONS.get(role, [])
+        if permission not in perms:
+            from error_handlers import AuthorizationError
+            raise AuthorizationError(
+                message=f"Role '{role}' does not have '{permission}' permission.",
+                details={"role": role, "required_permission": permission},
+            )
+        return current_user
+    return _check
+
+
+def check_brute_force(identifier: str):
+    """Check if the identifier (username/IP) is locked out due to brute-force."""
+    entry = _login_attempts.get(identifier)
+    if not entry:
+        return
+    if entry.get("locked_until"):
+        if datetime.now(timezone.utc) < entry["locked_until"]:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Account locked due to too many failed attempts. Try again later.",
+            )
+        else:
+            # Lockout expired, reset
+            del _login_attempts[identifier]
+
+
+def record_login_failure(identifier: str):
+    """Record a failed login attempt."""
+    if identifier not in _login_attempts:
+        _login_attempts[identifier] = {"count": 0, "locked_until": None}
+    _login_attempts[identifier]["count"] += 1
+    if _login_attempts[identifier]["count"] >= MAX_LOGIN_ATTEMPTS:
+        _login_attempts[identifier]["locked_until"] = (
+            datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_MINUTES)
+        )
+        logger.warning(f"Brute-force lockout for: {identifier}")
+
+
+def clear_login_attempts(identifier: str):
+    """Clear failed login attempts on successful login."""
+    _login_attempts.pop(identifier, None)
+
+
 # ═══════════════════════════════════════════
 # User Management
 # ═══════════════════════════════════════════
@@ -270,10 +358,25 @@ def register_user(user: UserRegister) -> dict:
     return {"username": user.username, "role": user.role}
 
 
-def authenticate_user(user: UserLogin) -> TokenResponse:
+async def authenticate_user(user: UserLogin) -> TokenResponse:
     """Authenticate a user and return JWT tokens."""
+    import asyncio
+    # Check brute-force lockout
+    check_brute_force(user.username)
+
     db_user = users_db.get(user.username)
-    if not db_user or not verify_password(user.password, db_user["password_hash"]):
+    if not db_user:
+        record_login_failure(user.username)
+        _log_auth_event("login_failure", user.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+
+    # Run bcrypt in thread pool to avoid blocking the event loop
+    password_valid = await asyncio.to_thread(verify_password, user.password, db_user["password_hash"])
+    if not password_valid:
+        record_login_failure(user.username)
         _log_auth_event("login_failure", user.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -286,6 +389,9 @@ def authenticate_user(user: UserLogin) -> TokenResponse:
 
     # Log auth event (additive)
     _log_auth_event("login_success", user.username, {"role": db_user["role"]})
+
+    # Clear brute-force counter on success
+    clear_login_attempts(user.username)
 
     logger.info(f"User authenticated: {user.username}")
     return TokenResponse(
