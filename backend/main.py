@@ -10,6 +10,7 @@ import time
 import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+import asyncio
 from typing import Optional
 
 from fastapi import (
@@ -28,11 +29,10 @@ from dotenv import load_dotenv
 from auth import (
     UserRegister, UserLogin, TokenResponse, RefreshRequest,
     ChatRequest, ChatResponse, UserInfo, register_user, authenticate_user, refresh_access_token,
-    get_current_user, users_db, require_permission,
+    get_current_user, users_db, require_permission, verify_admin_key,
     ROLE_PERMISSIONS, VALID_ROLES,
 )
 from vector_store import vector_store
-from pdf_ingester import ingest_all_pdfs
 from rag_pipeline import (
     generate_response, 
     generate_response_stream,
@@ -49,14 +49,17 @@ from analytics import (
     get_ai_performance_metrics, get_system_health,
     export_analytics_csv, set_server_start_time,
 )
-from document_manager import (
-    upload_document, list_documents, get_document,
-    delete_document, update_document_metadata,
-)
 from websocket_manager import ws_manager
 from cache import query_cache
+from evaluator import Evaluator, IRMetrics
+from stress_tester import StressTester
+from auth import Gatekeeper, review_queue as auth_review_queue
+from multi_agent import RetrieverAgent, SynthesisAgent, SharedState
+from analytics import Strategist
+from sse_manager import sse_manager
 
-load_dotenv()
+# Load environment variables from the same directory as this file
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ── Structured Logging (replaces basicConfig) ──
 setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -72,40 +75,44 @@ SERVER_START_TIME = None
 # ── Lifespan ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize vector store and database on startup."""
+    """Initialize startup tasks in the background while uvicorn starts."""
     global SERVER_START_TIME
     SERVER_START_TIME = datetime.now(timezone.utc)
     set_server_start_time(SERVER_START_TIME)
 
     logger.info("═" * 60)
-    logger.info("  PAGANI ZONDA R — Enterprise Intelligence API")
+    logger.info("  PAGANI ZONDA R — Enterprise Intelligence API (Loading...)")
     logger.info("═" * 60)
 
-    # Initialize database
-    try:
-        init_db()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        logger.warning("API will start but persistence features may fail.")
+    async def _background_init():
+        """Handles heavy-duty initialization without blocking the event loop."""
+        # Initialize database
+        try:
+            from database import init_db
+            await asyncio.to_thread(init_db)
+            
+            from auth import _load_users_from_db
+            await asyncio.to_thread(_load_users_from_db)
+            logger.info("Background: Database initialized and users loaded.")
+        except Exception as e:
+            logger.error(f"Background: Database initialization failed: {e}")
 
-    # Initialize vector store
-    try:
-        vector_store.initialize()
-        if vector_store.needs_pdf_ingestion():
-            pdf_chunks = ingest_all_pdfs()
-            if pdf_chunks:
-                vector_store.ingest_pdf_chunks(pdf_chunks)
-        logger.info("Vector store initialized successfully.")
-    except Exception as e:
-        logger.error(f"Vector store initialization failed: {e}")
-        logger.warning("API will start but /chat endpoints may fail.")
+        # Initialize vector store
+        try:
+            await asyncio.to_thread(vector_store.initialize)
+            logger.info("Background: Vector store initialized.")
+        except Exception as e:
+            logger.error(f"Background: Vector store initialization failed: {e}")
 
-    log_event("pagani.api", "system_startup", metadata={
-        "timestamp": SERVER_START_TIME.isoformat()
-    })
+        log_event("pagani.api", "system_startup", metadata={
+            "timestamp": SERVER_START_TIME.isoformat()
+        })
+        logger.info("Background Initialization Complete.")
 
-    logger.info("API server ready.")
+    # Launch background task and return lifespan control immediately
+    asyncio.create_task(_background_init())
+    
+    logger.info("API server yielding to uvicorn (instant startup mode enabled).")
     yield
     logger.info("API server shutting down.")
 
@@ -180,38 +187,54 @@ app.add_middleware(
 
 def _track_analytics(event_type: str, user_id: str | None = None, metadata: dict | None = None):
     """Track a usage analytics event (fire-and-forget)."""
+    def _write():
+        try:
+            from database import get_db_session
+            from models import AnalyticsEvent
+            with get_db_session() as db:
+                db.add(AnalyticsEvent(
+                    event_type=event_type,
+                    user_id=user_id,
+                    metadata_=metadata,
+                ))
+        except Exception as e:
+            logger.warning(f"Analytics tracking failed (non-fatal): {e}")
+
+    # Use a background task for fire-and-forget recording
+    import asyncio
     try:
-        from database import get_db_session
-        from models import AnalyticsEvent
-        with get_db_session() as db:
-            db.add(AnalyticsEvent(
-                event_type=event_type,
-                user_id=user_id,
-                metadata_=metadata,
-            ))
-    except Exception as e:
-        logger.warning(f"Analytics tracking failed (non-fatal): {e}")
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(asyncio.to_thread(_write))
+        else:
+            _write()
+    except Exception:
+        # Fallback to sync write if no loop is available (e.g. startup)
+        _write()
 
 
 # ═══════════════════════════════════════════
 # Chat Persistence Helper
 # ═══════════════════════════════════════════
 
-def _persist_chat(username: str, question: str, response: str):
-    """Persist a chat Q&A pair to the database (fire-and-forget)."""
-    try:
-        from database import get_db_session
-        from models import ChatHistory, User
-        with get_db_session() as db:
-            user = db.query(User).filter(User.name == username).first()
-            if user:
-                db.add(ChatHistory(
-                    user_id=user.id,
-                    question=question,
-                    response=response,
-                ))
-    except Exception as e:
-        logger.warning(f"Chat persistence failed (non-fatal): {e}")
+async def _persist_chat(username: str, question: str, response: str):
+    """Persist a chat Q&A pair to the database (async-safe)."""
+    def _sync_persist():
+        try:
+            from database import get_db_session
+            from models import ChatHistory, User
+            with get_db_session() as db:
+                user = db.query(User).filter(User.name == username).first()
+                if user:
+                    db.add(ChatHistory(
+                        user_id=user.id,
+                        question=question,
+                        response=response,
+                    ))
+        except Exception as e:
+            logger.warning(f"Chat persistence failed: {e}")
+            
+    await asyncio.to_thread(_sync_persist)
 
 
 # ═══════════════════════════════════════════
@@ -261,7 +284,7 @@ async def health_check_detailed(current_user: dict = Depends(require_permission(
 async def register(request: Request, user: UserRegister):
     """Register a new user with username, password, and role."""
     logger.info(f"Registration attempt: {user.username} (role: {user.role})")
-    result = register_user(user)
+    result = await register_user(user)
     _track_analytics("user_registered", user_id=user.username, metadata={"role": user.role})
     return {"message": "User registered successfully", **result}
 
@@ -321,9 +344,16 @@ async def chat(
     _track_analytics("query_submitted", user_id=username, metadata={"question_length": len(body.question)})
 
     try:
+        # Step 0: Cache Check
+        cache_key = f"chat:{user_role}:{body.question}"
+        cached_result = query_cache.get(cache_key)
+        if cached_result:
+            logger.info(f"Cache HIT for user {username} | query: '{body.question[:50]}'")
+            return ChatResponse(**cached_result)
+
         # Step 1: Agentic Routing (Decide whether to search and reformulate query)
         history = _get_history(username)
-        router_decision = agentic_router(body.question, history)
+        router_decision = await agentic_router(body.question, history)
         log_event("pagani.api", "role_routing", user_id=username, metadata=router_decision)
         
         # Step 2: Conditional Semantic Search
@@ -331,7 +361,8 @@ async def chat(
         if router_decision.get("needs_search", True):
             search_query = router_decision.get("search_query") or body.question
             logger.info(f"Router decided to search with query: '{search_query[:50]}'")
-            context_docs = vector_store.search(
+            context_docs = await asyncio.to_thread(
+                vector_store.search,
                 query=search_query,
                 top_k=5,
                 user_role=user_role,
@@ -342,7 +373,7 @@ async def chat(
             logger.info(f"Router decided to skip vector search for user {username}")
 
         # Step 3: Generate response
-        result = generate_response(
+        result = await generate_response(
             question=body.question,
             context_docs=context_docs,
             user_role=user_role,
@@ -365,18 +396,38 @@ async def chat(
         })
 
         # Persist chat to DB (additive)
-        _persist_chat(username, body.question, result["answer"])
+        await _persist_chat(username, body.question, result["answer"])
 
-        return ChatResponse(
-            answer=result["answer"],
-            sources=result["sources"],
-            confidence=result["confidence"],
-            user_role=user_role,
-        )
+        chat_response = {
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "confidence": result["confidence"],
+            "user_role": user_role,
+        }
+
+        # Cache the result
+        query_cache.set(cache_key, chat_response)
+
+        return ChatResponse(**chat_response)
 
     except RuntimeError as e:
+        err_msg = str(e)
+        if "QUOTA_EXCEEDED" in err_msg:
+            logger.error(f"Quota Exceeded for user {username}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Your AI quota has been exceeded. Please check your Gemini API plan or billing details in Google AI Studio. (Error 429: Quota Exceeded)",
+            )
+        
+        if "INVALID_API_KEY" in err_msg:
+            logger.error(f"Invalid API Key for user {username}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Your Gemini API key is expired or invalid. Please update GEMINI_API_KEY in your backend/.env file and restart the server.",
+            )
+        
         logger.error(f"RAG pipeline error for user {username}: {e}")
-        log_event("pagani.api", "api_error", user_id=username, metadata={"error": str(e)})
+        log_event("pagani.api", "api_error", user_id=username, metadata={"error": err_msg})
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The AI service is temporarily unavailable. Please try again.",
@@ -412,7 +463,7 @@ async def chat_debug(
     try:
         # Step 1: Agentic Routing
         history = _get_history(username)
-        router_decision = agentic_router(body.question, history)
+        router_decision = await agentic_router(body.question, history)
 
         # Step 2: Search with debug info
         context_docs = []
@@ -430,7 +481,8 @@ async def chat_debug(
             search_query = router_decision.get("search_query") or body.question
 
             # Use the debug-enhanced search
-            search_result = vector_store.search_with_debug(
+            search_result = await asyncio.to_thread(
+                vector_store.search_with_debug,
                 query=search_query,
                 top_k=5,
                 user_role=user_role,
@@ -442,7 +494,7 @@ async def chat_debug(
 
         # Step 3: Generate response
         t_gen = _time.time()
-        result = generate_response(
+        result = await generate_response(
             question=body.question,
             context_docs=context_docs,
             user_role=user_role,
@@ -460,7 +512,7 @@ async def chat_debug(
         })
 
         # Persist chat (additive, same as normal endpoint)
-        _persist_chat(username, body.question, result["answer"])
+        await _persist_chat(username, body.question, result["answer"])
 
         return {
             "answer": result["answer"],
@@ -506,14 +558,30 @@ async def chat_stream(
     _track_analytics("chat_started", user_id=username, metadata={"streaming": True})
 
     try:
+        # Step 0: Cache Check (for simplicity, only full completions are cached)
+        cache_key = f"chat_stream:{user_role}:{body.question}"
+        cached_result = query_cache.get(cache_key)
+        
+        if cached_result:
+            logger.info(f"Stream Cache HIT for user {username} | query: '{body.question[:50]}'")
+            async def cached_generator():
+                yield f"data: {cached_result['answer']}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(
+                cached_generator(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+            )
+
         history = _get_history(username)
-        router_decision = agentic_router(body.question, history)
+        router_decision = await agentic_router(body.question, history)
         
         context_docs = []
         if router_decision.get("needs_search", True):
             search_query = router_decision.get("search_query") or body.question
             logger.info(f"Router decided to search with query: '{search_query[:50]}'")
-            context_docs = vector_store.search(
+            context_docs = await asyncio.to_thread(
+                vector_store.search,
                 query=search_query,
                 top_k=5,
                 user_role=user_role,
@@ -537,7 +605,11 @@ async def chat_stream(
 
             # Persist after streaming completes
             full_response = "".join(collected_chunks)
-            _persist_chat(username, body.question, full_response)
+            await _persist_chat(username, body.question, full_response)
+            
+            # Cache the result
+            query_cache.set(cache_key, {"answer": full_response})
+            
             _track_analytics("response_received", user_id=username, metadata={"streaming": True})
             log_event("pagani.api", "chat_response", user_id=username, metadata={"streaming": True})
 
@@ -552,8 +624,23 @@ async def chat_stream(
         )
 
     except RuntimeError as e:
+        err_msg = str(e)
+        if "QUOTA_EXCEEDED" in err_msg:
+            logger.error(f"Streaming Quota Exceeded for user {username}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Your AI quota has been exceeded. Please check your Gemini API plan or billing details. (Error 429: Quota Exceeded)",
+            )
+            
+        if "INVALID_API_KEY" in err_msg:
+            logger.error(f"Invalid API Key for user {username}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Your Gemini API key is expired or invalid. Please update GEMINI_API_KEY in your backend/.env file and restart the server.",
+            )
+        
         logger.error(f"Streaming RAG error for user {username}: {e}")
-        log_event("pagani.api", "api_error", user_id=username, metadata={"error": str(e)})
+        log_event("pagani.api", "api_error", user_id=username, metadata={"error": err_msg})
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The AI service is temporarily unavailable.",
@@ -593,6 +680,38 @@ async def v1_list_users(
         ],
         "total": len(users_db),
     }
+
+
+@v1_router.delete("/admin/users/{username}", summary="Delete user account")
+async def v1_delete_user(
+    username: str,
+    current_user: dict = Depends(require_permission("manage_users")),
+):
+    """Delete a user account and logically remove from the database."""
+    if username not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if username == current_user["username"]:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+
+    # Remove from DB
+    try:
+        from database import get_db_session
+        from models import User
+        with get_db_session() as db:
+            user = db.query(User).filter(User.name == username).first()
+            if user:
+                db.delete(user)
+    except Exception as e:
+        logger.error(f"Failed to delete user from database: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete user")
+
+    # Remove from active memory
+    del users_db[username]
+    
+    # Audit log
+    audit.log("user_deleted", current_user["username"], metadata={"deleted_user": username})
+    return {"message": f"User {username} deleted successfully"}
 
 
 @v1_router.put("/admin/users/{username}/role", summary="Change user role")
@@ -649,8 +768,26 @@ async def v1_role_audit_log(
     current_user: dict = Depends(require_permission("manage_users")),
 ):
     """View role change audit trail."""
-    logs = get_audit_logs(action="role_change", limit=limit)
-    return {"audit_logs": logs, "total": len(logs)}
+    try:
+        from database import get_db_session
+        from models import RoleAuditLog
+        with get_db_session() as db:
+            logs = db.query(RoleAuditLog).order_by(RoleAuditLog.timestamp.desc()).limit(limit).all()
+            formatted_logs = [
+                {
+                    "id": log.id,
+                    "changed_by": log.changed_by,
+                    "target_user": log.target_user,
+                    "old_role": log.old_role,
+                    "new_role": log.new_role,
+                    "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                }
+                for log in logs
+            ]
+            return {"audit_logs": formatted_logs, "total": len(formatted_logs)}
+    except Exception as e:
+        logger.error(f"Failed to retrieve role audit logs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve role audit logs")
 
 
 @v1_router.get("/admin/permissions", summary="View permission matrix")
@@ -747,80 +884,12 @@ async def v1_login_attempts(
 
 
 # ───────────────────────────
-# Document Management Endpoints
+# Document Management Endpoints (Read-Only)
 # ───────────────────────────
 
-@v1_router.post("/documents/upload", summary="Upload a document")
-async def v1_upload_document(
-    file: UploadFile = File(...),
-    title: Optional[str] = None,
-    current_user: dict = Depends(require_permission("write")),
-):
-    """Upload a PDF, DOCX, or TXT document for RAG ingestion."""
-    result = await upload_document(
-        file=file,
-        uploaded_by=current_user["username"],
-        title=title,
-    )
-    audit.log(
-        action=audit.ACTION_DOCUMENT_UPLOAD,
-        user_id=current_user["username"],
-        metadata={"filename": result.get("filename"), "chunks": result.get("chunk_count")},
-    )
-    return result
 
 
-@v1_router.get("/documents", summary="List documents")
-async def v1_list_documents(
-    limit: int = QueryParam(default=100, le=500),
-    offset: int = QueryParam(default=0, ge=0),
-    current_user: dict = Depends(get_current_user),
-):
-    """List all uploaded documents."""
-    docs = list_documents(limit=limit, offset=offset)
-    return {"documents": docs, "total": len(docs)}
 
-
-@v1_router.get("/documents/{doc_id}", summary="Get document details")
-async def v1_get_document(
-    doc_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Get details of a specific document."""
-    doc = get_document(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return doc
-
-
-@v1_router.delete("/documents/{doc_id}", summary="Delete a document")
-async def v1_delete_document(
-    doc_id: str,
-    current_user: dict = Depends(require_permission("delete")),
-):
-    """Delete a document (admin only)."""
-    success = delete_document(doc_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Document not found")
-    audit.log(
-        action=audit.ACTION_DOCUMENT_DELETE,
-        user_id=current_user["username"],
-        metadata={"document_id": doc_id},
-    )
-    return {"message": "Document deleted", "id": doc_id}
-
-
-@v1_router.put("/documents/{doc_id}/metadata", summary="Update document metadata")
-async def v1_update_document_metadata(
-    doc_id: str,
-    body: DocumentMetadataUpdate,
-    current_user: dict = Depends(require_permission("write")),
-):
-    """Update document metadata (title, tags)."""
-    result = update_document_metadata(doc_id, title=body.title, tags=body.tags)
-    if not result:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return result
 
 
 # ───────────────────────────
@@ -865,6 +934,552 @@ async def ws_logs(websocket: WebSocket):
             await ws_manager.send_personal(websocket, {"type": "ack", "message": data})
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, "logs")
+
+
+
+
+# ───────────────────────────
+# Evaluation Endpoints
+# ───────────────────────────
+
+class EvalRequest(BaseModel):
+    query: str
+    response: str
+    reference: Optional[str] = None
+    retrieved_ids: Optional[list[str]] = None
+    relevant_ids: Optional[list[str]] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_seconds: float = 0.0
+
+@v1_router.post("/evaluate", summary="Evaluate a RAG response")
+async def v1_evaluate(
+    body: EvalRequest,
+    current_user: dict = Depends(require_permission("execute")),
+):
+    """Run LLMJudge scoring + IR metrics + cost tracking and persist results."""
+    evaluator = Evaluator()
+    result = evaluator.evaluate(
+        query=body.query,
+        response=body.response,
+        reference=body.reference,
+        retrieved_ids=body.retrieved_ids,
+        relevant_ids=body.relevant_ids,
+        input_tokens=body.input_tokens,
+        output_tokens=body.output_tokens,
+        latency_seconds=body.latency_seconds,
+    )
+    return result
+
+
+@v1_router.post("/evaluate/ir-metrics", summary="Compute IR metrics only")
+async def v1_ir_metrics(
+    retrieved_ids: list[str],
+    relevant_ids: list[str],
+    current_user: dict = Depends(get_current_user),
+):
+    """Compute Precision, Recall, F1 without LLM judge."""
+    return IRMetrics.compute(retrieved_ids, relevant_ids)
+
+
+# ───────────────────────────
+# Admin – Review Queue / Feedback / Golden Answers
+# ───────────────────────────
+
+@v1_router.get("/admin/review-queue", summary="View flagged queries")
+async def v1_review_queue(
+    _key: str = Depends(verify_admin_key),
+):
+    """View all Gatekeeper-flagged queries awaiting review (X-Admin-Key)."""
+    items = []
+    try:
+        from database import get_db_session
+        from models import ReviewQueue as RQ
+        with get_db_session() as db:
+            rows = db.query(RQ).filter(RQ.status == "pending_review").order_by(RQ.created_at.desc()).all()
+            items = [{"id": r.id, "username": r.username, "question": r.question, "reason": r.reason, "status": r.status, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+    except Exception:
+        items = [{"id": k, **v} for k, v in auth_review_queue.items()]
+    return {"review_queue": items, "total": len(items)}
+
+
+class ReviewActionRequest(BaseModel):
+    action: str = Field(..., pattern="^(approve|reject|edit)$")
+    edited_response: Optional[str] = None
+
+
+@v1_router.patch("/admin/review/{item_id}", summary="Approve/reject/edit a flagged query")
+async def v1_review_action(
+    item_id: str,
+    body: ReviewActionRequest,
+    _key: str = Depends(verify_admin_key),
+):
+    """Resolve a review queue item with approve/reject/edit action (X-Admin-Key)."""
+    try:
+        from database import get_db_session
+        from models import ReviewQueue as RQ
+        with get_db_session() as db:
+            row = db.query(RQ).filter(RQ.id == item_id).first()
+            if not row:
+                raise HTTPException(status_code=404, detail="Review item not found")
+            if body.action == "approve":
+                row.status = "approved"
+            elif body.action == "reject":
+                row.status = "rejected"
+            elif body.action == "edit":
+                row.status = "approved"
+                if body.edited_response:
+                    row.final_response = body.edited_response
+            row.resolved_at = datetime.now(timezone.utc)
+            db.commit()
+            return {"message": f"Review item {body.action}d", "id": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"DB resolve failed: {e}")
+    if item_id in auth_review_queue:
+        auth_review_queue[item_id]["status"] = body.action + "d"
+        return {"message": f"Resolved (in-memory)", "id": item_id}
+    raise HTTPException(status_code=404, detail="Review item not found")
+
+
+@v1_router.get("/admin/audit-log", summary="View audit logs")
+async def v1_admin_audit_log(
+    action: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = QueryParam(default=100, le=500),
+    offset: int = QueryParam(default=0, ge=0),
+    _key: str = Depends(verify_admin_key),
+):
+    """View all audit log entries (X-Admin-Key)."""
+    logs = get_audit_logs(action=action, user_id=user_id, limit=limit, offset=offset)
+    return {"logs": logs, "total": len(logs)}
+
+
+@v1_router.get("/admin/strategist-reports", summary="View strategist reports")
+async def v1_admin_strategist_reports(
+    limit: int = QueryParam(default=20, le=100),
+    _key: str = Depends(verify_admin_key),
+):
+    """View AI strategist nightly analysis reports (X-Admin-Key)."""
+    try:
+        from database import get_db_session
+        from models import StrategistReport
+        with get_db_session() as db:
+            rows = db.query(StrategistReport).order_by(StrategistReport.created_at.desc()).limit(limit).all()
+            return {"reports": [{
+                "id": r.id,
+                "report_text": r.report_text,
+                "period_start": r.period_start.isoformat() if r.period_start else None,
+                "period_end": r.period_end.isoformat() if r.period_end else None,
+                "queries_analyzed": r.analyzed_count,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            } for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.error(f"Failed to list strategist reports: {e}")
+        return {"reports": [], "total": 0}
+
+
+class FeedbackRequest(BaseModel):
+    query: str
+    response: Optional[str] = None
+    rating: int = Field(..., ge=1, le=5)
+    comment: Optional[str] = None
+
+@v1_router.post("/query/feedback", summary="Submit user feedback")
+async def v1_submit_feedback(
+    body: FeedbackRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Submit feedback on a response (rating + optional comment)."""
+    try:
+        from database import get_db_session
+        from models import Feedback
+        with get_db_session() as db:
+            db.add(Feedback(
+                user_id=current_user["username"],
+                query=body.query,
+                response=body.response,
+                rating=body.rating,
+                comment=body.comment,
+            ))
+            db.commit()
+    except Exception as e:
+        logger.error(f"Feedback persistence failed: {e}")
+    return {"message": "Feedback submitted", "rating": body.rating}
+
+
+class GoldenAnswerRequest(BaseModel):
+    query: str
+    expected_answer: str
+    relevant_chunk_ids: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
+
+@v1_router.post("/admin/golden-answers", summary="Add a golden answer")
+async def v1_add_golden_answer(
+    body: GoldenAnswerRequest,
+    current_user: dict = Depends(require_permission("manage_users")),
+):
+    """Add a ground-truth golden answer for evaluation benchmarks."""
+    try:
+        from database import get_db_session
+        from models import GoldenAnswer
+        with get_db_session() as db:
+            ga = GoldenAnswer(
+                query=body.query,
+                expected_answer=body.expected_answer,
+                relevant_chunk_ids=body.relevant_chunk_ids,
+                tags=body.tags,
+            )
+            db.add(ga)
+            db.commit()
+            return {"message": "Golden answer stored", "id": ga.id}
+    except Exception as e:
+        logger.error(f"Golden answer persistence failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to store golden answer")
+
+
+@v1_router.get("/admin/golden-answers", summary="List golden answers")
+async def v1_list_golden_answers(
+    limit: int = QueryParam(default=50, le=500),
+    current_user: dict = Depends(require_permission("manage_users")),
+):
+    """List all ground-truth golden answers."""
+    try:
+        from database import get_db_session
+        from models import GoldenAnswer
+        with get_db_session() as db:
+            rows = db.query(GoldenAnswer).order_by(GoldenAnswer.created_at.desc()).limit(limit).all()
+            return {"golden_answers": [{"id": r.id, "query": r.query, "expected_answer": r.expected_answer, "tags": r.tags} for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.error(f"Failed to list golden answers: {e}")
+        return {"golden_answers": [], "total": 0}
+
+
+# ───────────────────────────
+# Stress Test Endpoints
+# ───────────────────────────
+
+class StressTestRequest(BaseModel):
+    test_type: str = Field(default="all", pattern="^(all|bias|evasion|injection)$")
+    queries: Optional[list[str]] = None
+
+
+@v1_router.post("/stress-test/run", summary="Run stress test suite")
+@limiter.limit("1/minute")
+async def v1_stress_run(
+    request: Request,
+    body: StressTestRequest,
+    _key: str = Depends(verify_admin_key),
+):
+    """Run adversarial stress tests via Server-Sent Events (X-Admin-Key, 1/min max)."""
+    tester = StressTester()
+    
+    async def event_generator():
+        import json
+        if body.test_type == "bias":
+            gen = tester.run_bias_test_stream()
+        elif body.test_type == "evasion":
+            gen = tester.run_evasion_test_stream()
+        elif body.test_type == "injection":
+            gen = tester.run_injection_test_stream()
+        else:
+            gen = tester.run_all_stream()
+            
+        async for event in gen:
+            yield event
+            
+        yield "data: [DONE]\n\n"
+        
+        # Log to audit after completion
+        audit.log(action="stress_test_executed", user_id="admin", metadata={
+            "test_type": body.test_type,
+            "streaming": True,
+        })
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+# ───────────────────────────
+# Evaluation Endpoints
+# ───────────────────────────
+
+@v1_router.get("/evaluations/summary", summary="Evaluation metrics summary")
+async def v1_evaluations_summary():
+    """Public summary of RAG evaluation metrics."""
+    try:
+        from database import get_db_session
+        from models import Evaluation
+        from sqlalchemy import func
+        with get_db_session() as db:
+            stats = db.query(
+                func.avg(Evaluation.faithfulness).label("avg_faithfulness"),
+                func.avg(Evaluation.relevance).label("avg_relevance"),
+                func.avg(Evaluation.completeness).label("avg_completeness"),
+                func.avg(Evaluation.f1_score).label("avg_f1"),
+                func.avg(Evaluation.latency_ms).label("avg_latency_ms"),
+                func.avg(Evaluation.estimated_cost_usd).label("avg_cost_usd"),
+                func.count(Evaluation.id).label("total_queries"),
+            ).first()
+            # Queries by day (last 7 days)
+            from datetime import timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+            daily = db.query(
+                func.date(Evaluation.created_at).label("day"),
+                func.count(Evaluation.id).label("count"),
+            ).filter(
+                Evaluation.created_at >= cutoff
+            ).group_by(
+                func.date(Evaluation.created_at)
+            ).order_by("day").all()
+            return {
+                "avg_faithfulness": round(float(stats.avg_faithfulness or 0), 3),
+                "avg_relevance": round(float(stats.avg_relevance or 0), 3),
+                "avg_completeness": round(float(stats.avg_completeness or 0), 3),
+                "avg_f1": round(float(stats.avg_f1 or 0), 3),
+                "avg_latency_ms": round(float(stats.avg_latency_ms or 0), 1),
+                "avg_cost_usd": round(float(stats.avg_cost_usd or 0), 6),
+                "total_queries": int(stats.total_queries or 0),
+                "queries_by_day": [{"day": str(d.day), "count": d.count} for d in daily],
+            }
+    except Exception as e:
+        logger.error(f"Evaluations summary failed: {e}")
+        return {"avg_faithfulness": 0, "avg_relevance": 0, "avg_completeness": 0, "avg_f1": 0, "avg_latency_ms": 0, "avg_cost_usd": 0, "total_queries": 0, "queries_by_day": []}
+
+
+@v1_router.get("/evaluations/recent", summary="Recent evaluation records")
+async def v1_evaluations_recent(
+    limit: int = QueryParam(default=50, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    """Last N evaluation records (JWT auth)."""
+    try:
+        from database import get_db_session
+        from models import Evaluation
+        with get_db_session() as db:
+            rows = db.query(Evaluation).order_by(Evaluation.created_at.desc()).limit(limit).all()
+            return {"evaluations": [{
+                "id": r.id,
+                "query": r.query,
+                "faithfulness": r.faithfulness,
+                "relevance": r.relevance,
+                "completeness": r.completeness,
+                "precision": r.precision,
+                "recall": r.recall,
+                "f1_score": r.f1_score,
+                "confidence_score": r.confidence_score,
+                "latency_ms": r.latency_ms,
+                "estimated_cost_usd": r.estimated_cost_usd,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            } for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.error(f"Evaluations recent failed: {e}")
+        return {"evaluations": [], "total": 0}
+
+
+# ───────────────────────────
+# Pipeline Status
+# ───────────────────────────
+
+# In-memory pipeline node status dict updated during queries
+PIPELINE_STATUS = {
+    "data_sources": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "restructuring": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "chunking": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "metadata": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "planner": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "tool_execution": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "router": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "multi_agent": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "agent_1": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "agent_2": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "agent_3": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "human_validation": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "evaluation": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+    "database": {"status": "idle", "last_run_ms": 0, "last_run_at": None},
+}
+
+
+@v1_router.get("/pipeline/status", summary="Live pipeline node status")
+async def v1_pipeline_status(
+    current_user: dict = Depends(get_current_user),
+):
+    """Returns in-memory dict of pipeline node statuses (JWT auth)."""
+    return PIPELINE_STATUS
+
+
+# ───────────────────────────
+# SSE-Integrated Full Pipeline Chat
+# ───────────────────────────
+
+@v1_router.post("/chat/sse", summary="Full pipeline chat with SSE events")
+async def v1_chat_sse(
+    request: Request,
+    body: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Full RAG pipeline with Server-Sent Events at each stage:
+    planning → gatekeeper → retrieval → routing → agents → cost → evaluation → done
+    """
+    import asyncio
+    import time
+    from rag_pipeline import Planner, ToolExecution, ConditionalRouter as CondRouter
+    from multi_agent import run_multi_agent, run_single_agent
+    from evaluator import Evaluator, LatencyCostTracker
+    from auth import Gatekeeper as GK
+
+    username = current_user["username"]
+    user_role = current_user["role"]
+    t_start = time.time()
+    
+    sse_queue = asyncio.Queue()
+
+    async def pipeline_worker():
+        try:
+            await sse_queue.put({"event": "progress", "data": {"step": 1, "label": "Planning query", "icon": "brain"}})
+            planner = Planner()
+            plan = await planner.plan(body.question, sse_queue)
+            
+            gk = GK()
+            gate_result = gk.check_query(body.question, username)
+            await sse_queue.put({"event": "gatekeeper", "data": {"status": gate_result["status"], "query": body.question[:100]}})
+            
+            if gate_result["status"] == "under_review":
+                await sse_queue.put({"event": "done", "data": {"answer": "Your query has been flagged for human review.", "status": "under_review"}})
+                await sse_queue.put(None)
+                return
+                
+            await sse_queue.put({"event": "progress", "data": {"step": 2, "label": "Retrieving context", "icon": "search"}})
+            tool_exec = ToolExecution(vector_store, sse_queue)
+            chunks = await tool_exec.execute(plan, body.question)
+            
+            await sse_queue.put({"event": "progress", "data": {"step": 3, "label": "Routing query", "icon": "route"}})
+            router = CondRouter(sse_queue)
+            route_decision = await router.route(chunks)
+            
+            await sse_queue.put({"event": "progress", "data": {"step": 4, "label": "Running generation agents", "icon": "bot"}})
+            decision = route_decision["decision"]
+            final_response = ""
+            
+            if decision == "multi_agent" or decision == "multi-agent":
+                state = await run_multi_agent(body.question, chunks, {"user_role": user_role, "format": body.format}, sse_queue)
+                final_response = state["final_response"]
+            elif decision == "human_validation" or decision == "human review":
+                final_response = "This query requires human review due to low confidence."
+                await sse_queue.put({"event": "done", "data": {"answer": final_response, "status": "under_review"}})
+                await sse_queue.put(None)
+                return
+            else:
+                state = await run_single_agent(body.question, chunks, sse_queue, metadata={"user_role": user_role, "format": body.format})
+                final_response = state["final_response"]
+                
+            # --- Disabled evaluation to maximize speed ---
+            # try:
+            #     evaluator = Evaluator()
+            #     eval_result = await evaluator.evaluate_async(...)
+            # except Exception as e:
+            #     logger.error(f"Evaluation failed: {e}")
+                
+            total_ms = int((time.time() - t_start) * 1000)
+            _track_analytics("sse_pipeline_complete", user_id=username, metadata={
+                "strategy": plan.get("strategy"),
+                "agent_path": decision,
+                "total_ms": total_ms,
+            })
+            
+            await sse_queue.put({"event": "done", "data": {
+                "answer": final_response,
+                "confidence": route_decision["confidence"],
+                "strategy": plan.get("strategy"),
+                "agent_path": decision,
+                "total_pipeline_ms": total_ms
+            }})
+            
+        except Exception as e:
+            logger.error(f"Pipeline processing failed: {e}", exc_info=True)
+            await sse_queue.put({"event": "error", "data": {"message": str(e)}})
+        finally:
+            await sse_queue.put(None) # Signal termination
+
+    async def pipeline_generator():
+        # Start processing task
+        asyncio.create_task(pipeline_worker())
+        
+        while True:
+            msg = await sse_queue.get()
+            if msg is None:
+                break
+            yield sse_manager._format_sse(msg["event"], msg["data"])
+
+    return StreamingResponse(
+        pipeline_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ───────────────────────────
+# SSE Streaming Endpoints
+# ───────────────────────────
+
+@v1_router.get("/events/stream", summary="SSE event stream")
+async def v1_sse_stream(
+    channel: str = QueryParam(default="default"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Subscribe to real-time Server-Sent Events with automatic heartbeat."""
+    queue = sse_manager.subscribe(channel)
+
+    async def event_generator():
+        async for message in sse_manager.stream(queue, channel):
+            yield message
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@v1_router.post("/events/publish", summary="Publish an SSE event")
+async def v1_sse_publish(
+    event: str = "update",
+    channel: str = "default",
+    current_user: dict = Depends(require_permission("execute")),
+):
+    """Publish an event to all SSE subscribers on a channel."""
+    await sse_manager.publish(event, {
+        "message": f"Event from {current_user['username']}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }, channel)
+    return {"published": True, "channel": channel, "subscribers": sse_manager.active_connections(channel)}
+
+
+@v1_router.get("/events/status", summary="SSE connection stats")
+async def v1_sse_status(
+    current_user: dict = Depends(get_current_user),
+):
+    """View active SSE subscriber count per channel."""
+    return {
+        "channels": {ch: len(subs) for ch, subs in sse_manager._channels.items()},
+        "total_subscribers": sum(len(s) for s in sse_manager._channels.values()),
+    }
 
 
 # ── Mount V1 Router ──
