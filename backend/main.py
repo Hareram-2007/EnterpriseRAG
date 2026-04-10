@@ -53,7 +53,9 @@ from websocket_manager import ws_manager
 from cache import query_cache
 from evaluator import Evaluator, IRMetrics
 from stress_tester import StressTester
-from auth import review_queue as auth_review_queue
+from auth import Gatekeeper, review_queue as auth_review_queue
+from multi_agent import RetrieverAgent, SynthesisAgent, SharedState
+from analytics import Strategist
 from sse_manager import sse_manager
 
 # Load environment variables from the same directory as this file
@@ -1037,7 +1039,7 @@ async def v1_review_action(
         logger.warning(f"DB resolve failed: {e}")
     if item_id in auth_review_queue:
         auth_review_queue[item_id]["status"] = body.action + "d"
-        return {"message": "Resolved (in-memory)", "id": item_id}
+        return {"message": f"Resolved (in-memory)", "id": item_id}
     raise HTTPException(status_code=404, detail="Review item not found")
 
 
@@ -1174,6 +1176,7 @@ async def v1_stress_run(
     tester = StressTester()
     
     async def event_generator():
+        import json
         if body.test_type == "bias":
             gen = tester.run_bias_test_stream()
         elif body.test_type == "evasion":
@@ -1330,6 +1333,7 @@ async def v1_chat_sse(
     import time
     from rag_pipeline import Planner, ToolExecution, ConditionalRouter as CondRouter
     from multi_agent import run_multi_agent, run_single_agent
+    from evaluator import Evaluator, LatencyCostTracker
     from auth import Gatekeeper as GK
 
     username = current_user["username"]
